@@ -2,9 +2,15 @@
 use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, RawSocket};
+use std::{
+    future::poll_fn,
+    io::{IoSlice, Write},
+};
+
+use tokio::net::TcpStream;
 
 use super::*;
-use crate::common::IoSession;
+use crate::common::{IoSession, SyncReadAdapter};
 
 /// A wrapper around an underlying raw stream which implements the TLS or SSL
 /// protocol.
@@ -29,6 +35,10 @@ impl<IO> TlsStream<IO> {
     #[inline]
     pub fn into_inner(self) -> (IO, ServerConnection) {
         (self.io, self.session)
+    }
+
+    pub fn is_jls(&self) -> Option<bool> {
+        self.session.is_jls()
     }
 }
 
@@ -145,5 +155,135 @@ where
 {
     fn as_raw_socket(&self) -> RawSocket {
         self.get_ref().0.as_raw_socket()
+    }
+}
+
+impl<IO> TlsStream<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    pub async fn forward(mut self) -> io::Result<()> {
+        let mut upstream_sock;
+        if let Some(addr) = self.session.get_upstream_addr() {
+            upstream_sock = TcpStream::connect(addr).await.unwrap();
+        } else {
+            return Ok(());
+        }
+        let func = |cx: &mut Context<'_>| -> Poll<io::Result<()>> {
+            loop {
+                let cli_wants_write = self.session.wants_write();
+                let mut stream =
+                    Stream::new(&mut self.io, &mut self.session).set_eof(!self.state.readable());
+                let mut keep_going = false;
+                if cli_wants_write {
+                    match stream.write_io(cx) {
+                        Poll::Ready(Ok(_n)) => {
+                            keep_going = true;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => {}
+                    }
+                }
+                match stream.read_io(cx) {
+                    Poll::Ready(Ok(0)) => return Poll::Ready(Ok(())),
+                    Poll::Ready(Ok(_n)) => {
+                        keep_going = true;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        return Poll::Ready(Err(e));
+                    }
+                    Poll::Pending => {}
+                }
+
+                let wants_write_upstream = self.session.wants_write_upstream();
+                if wants_write_upstream {
+                    match self.write_upstream_io(cx, &mut upstream_sock) {
+                        Poll::Ready(Ok(0)) => {}
+                        Poll::Ready(Ok(_n)) => {
+                            keep_going = true;
+                        }
+                        Poll::Ready(Err(e)) => {
+                            return Poll::Ready(Err(e).into());
+                        }
+                        Poll::Pending => {}
+                    }
+                }
+                match self.read_upstream_io(cx, &mut upstream_sock) {
+                    Poll::Ready(Ok(0)) => return Poll::Ready(Ok(())),
+                    Poll::Ready(Ok(_n)) => {
+                        keep_going = true;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        return Poll::Ready(Err(e));
+                    }
+                    Poll::Pending => {}
+                }
+                if !keep_going {
+                    break;
+                }
+            }
+            Poll::Pending
+        };
+        poll_fn(func).await.map(|_| ())
+    }
+
+    pub fn read_upstream_io<T: AsyncRead + Unpin>(
+        &mut self,
+        cx: &mut Context,
+        rd: &mut T,
+    ) -> Poll<io::Result<usize>> {
+        let mut upstream_reader = SyncReadAdapter { io: rd, cx };
+        match self.session.read_upstream(&mut upstream_reader) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+
+    pub fn write_upstream_io<T: AsyncWrite + Unpin>(
+        &mut self,
+        cx: &mut Context,
+        wr: &mut T,
+    ) -> Poll<io::Result<usize>> {
+        struct Writer<'a, 'b, T> {
+            io: &'a mut T,
+            cx: &'a mut Context<'b>,
+        }
+
+        impl<'a, 'b, T: Unpin> Writer<'a, 'b, T> {
+            #[inline]
+            fn poll_with<U>(
+                &mut self,
+                f: impl FnOnce(Pin<&mut T>, &mut Context<'_>) -> Poll<io::Result<U>>,
+            ) -> io::Result<U> {
+                match f(Pin::new(self.io), self.cx) {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
+                }
+            }
+        }
+
+        impl<'a, 'b, T: AsyncWrite + Unpin> Write for Writer<'a, 'b, T> {
+            #[inline]
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.poll_with(|io, cx| io.poll_write(cx, buf))
+            }
+
+            #[inline]
+            fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+                self.poll_with(|io, cx| io.poll_write_vectored(cx, bufs))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.poll_with(|io, cx| io.poll_flush(cx))
+            }
+        }
+
+        let mut writer = Writer { io: wr, cx };
+
+        match self.session.write_upstream(&mut writer) {
+            Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => Poll::Pending,
+            result => Poll::Ready(result),
+        }
     }
 }

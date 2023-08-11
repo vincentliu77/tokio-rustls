@@ -1,4 +1,5 @@
 use argh::FromArgs;
+use rustls::JlsServerConfig;
 use rustls_pemfile::{certs, rsa_private_keys};
 use std::fs::File;
 use std::io::{self, BufReader};
@@ -55,11 +56,14 @@ async fn main() -> io::Result<()> {
     let mut keys = load_keys(&options.key)?;
     let flag_echo = options.echo_mode;
 
-    let config = rustls::ServerConfig::builder()
+    let mut config = rustls::ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(certs, keys.remove(0))
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    config.jls_config = JlsServerConfig::new("3070111071563328618171495819203123318",
+    "3070111071563328618171495819203123318", "https://www.visa.cn:443").unwrap();
+    config.jls_config.push_sni("codepen.io", "https://codepen.io:443").unwrap();
     let acceptor = TlsAcceptor::from(Arc::new(config));
 
     let listener = TcpListener::bind(&addr).await?;
@@ -70,6 +74,13 @@ async fn main() -> io::Result<()> {
 
         let fut = async move {
             let mut stream = acceptor.accept(stream).await?;
+
+            if stream.is_jls() == Some(false) {
+                println!("Forwarding");
+                let e = stream.forward().await;
+                println!("Stop forwarding: {:?}",e);
+                return Ok(());
+            }
 
             if flag_echo {
                 let (mut reader, mut writer) = split(stream);
