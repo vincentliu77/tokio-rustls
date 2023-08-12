@@ -32,6 +32,10 @@ impl<IO> TlsStream<IO> {
     pub fn into_inner(self) -> (IO, ClientConnection) {
         (self.io, self.session)
     }
+
+    pub fn is_jls(&self) -> Option<bool> {
+        self.session.is_jls()
+    }
 }
 
 #[cfg(unix)]
