@@ -4,7 +4,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::windows::io::{AsRawSocket, RawSocket};
 use std::{
     future::poll_fn,
-    io::{IoSlice, Write},
+    io::{IoSlice, Write, Read, Cursor},
 };
 
 use tokio::net::TcpStream;
@@ -19,6 +19,7 @@ pub struct TlsStream<IO> {
     pub(crate) io: IO,
     pub(crate) session: ServerConnection,
     pub(crate) state: TlsState,
+    pub(crate) earlydata: Option<Cursor<Vec<u8>>>,
 }
 
 impl<IO> TlsStream<IO> {
@@ -72,6 +73,15 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if let Some(read) = &mut this.earlydata {
+            let n = read.read(buf.initialize_unfilled()).unwrap();
+            buf.advance(n);
+            if n == 0 {
+                this.earlydata = None;
+            } else if buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+        }
         let mut stream =
             Stream::new(&mut this.io, &mut this.session).set_eof(!this.state.readable());
 

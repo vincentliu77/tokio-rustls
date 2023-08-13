@@ -52,7 +52,7 @@ pub mod server;
 use common::{MidHandshake, Stream, TlsState};
 use rustls::{ClientConfig, ClientConnection, CommonState, ServerConfig, ServerConnection};
 use std::future::Future;
-use std::io;
+use std::io::{self, Read, Cursor};
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(windows)]
@@ -183,6 +183,7 @@ impl TlsAcceptor {
             session,
             io: stream,
             state: TlsState::Stream,
+            earlydata: None,
         }))
     }
 }
@@ -329,6 +330,7 @@ where
             session: conn,
             io: self.io,
             state: TlsState::Stream,
+            earlydata: None,
         }))
     }
 }
@@ -407,7 +409,18 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Future for Accept<IO> {
 
     #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.0).poll(cx).map_err(|(err, _)| err)
+        Pin::new(&mut self.0).poll(cx).map_ok(|mut x|
+        {
+            let mut earlydata = None;
+            if let Some(read) = &mut x.get_mut().1.early_data() {
+                let mut buf = Vec::new();
+                read.read_to_end(&mut buf).unwrap();
+                earlydata = Some(Cursor::new(buf));
+            }
+            x.earlydata = earlydata;
+            x
+        }
+        ).map_err(|(err, _)| err)
     }
 }
 
