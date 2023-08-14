@@ -4,7 +4,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::windows::io::{AsRawSocket, RawSocket};
 use std::{
     future::poll_fn,
-    io::{IoSlice, Write, Read, Cursor},
+    io::{Cursor, IoSlice, Read, Write},
 };
 
 use tokio::net::TcpStream;
@@ -73,13 +73,16 @@ where
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        let mut n = 0;
         if let Some(read) = &mut this.earlydata {
-            let n = read.read(buf.initialize_unfilled()).unwrap();
+            n = read.read(buf.initialize_unfilled()).unwrap();
             buf.advance(n);
             if n == 0 {
                 this.earlydata = None;
             } else if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
+            } else {
+                this.earlydata = None;
             }
         }
         let mut stream =
@@ -100,6 +103,13 @@ where
                     Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
                         this.state.shutdown_read();
                         Poll::Ready(Err(err))
+                    }
+                    Poll::Pending => {
+                        if n > 0 {
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        }
                     }
                     output => output,
                 }
