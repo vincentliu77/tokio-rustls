@@ -1,9 +1,12 @@
 use super::*;
 use crate::common::IoSession;
+use std::fmt::{Debug, Formatter};
+use std::mem;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, RawSocket};
+use tokio::sync::oneshot::{Receiver, Sender};
 
 /// A wrapper around an underlying raw stream which implements the TLS or SSL
 /// protocol.
@@ -15,6 +18,27 @@ pub struct TlsStream<IO> {
 
     #[cfg(feature = "early-data")]
     pub(crate) early_waker: Option<std::task::Waker>,
+    #[cfg(feature = "early-data")]
+    pub(crate) early_data_send: Option<Sender<bool>>,
+    #[cfg(feature = "early-data")]
+    pub(crate) early_data_accept: Option<ZeroRttAccept>,
+
+    pub(crate) jls_handler: Box<dyn JlsHandler<IO>>,
+}
+impl<IO> Debug for Box<dyn JlsHandler<IO>> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EarlyDataHandler")
+    }
+}
+pub trait JlsHandler<IO>: Send + Sync + Unpin {
+    fn handle(&mut self, stream: &mut TlsStream<IO>);
+}
+
+pub struct JlsDummyHandler;
+impl<IO> JlsHandler<IO> for JlsDummyHandler {
+    fn handle(&mut self, _: &mut TlsStream<IO>) {
+        ()
+    }
 }
 
 impl<IO> TlsStream<IO> {
@@ -35,6 +59,31 @@ impl<IO> TlsStream<IO> {
 
     pub fn is_jls(&self) -> Option<bool> {
         self.session.is_jls()
+    }
+
+    /// Set early data handler used for early data accepted or rejected
+    pub fn set_jls_handler<T>(&mut self, handler: T)
+    where
+        T: JlsHandler<IO> + 'static,
+    {
+        self.jls_handler = Box::new(handler);
+    }
+
+    /// Check whether early data accepted
+    #[cfg(feature = "early-data")]
+    pub fn early_data_accepted(&mut self) -> Option<ZeroRttAccept> {
+        self.early_data_accept.take()
+    }
+}
+
+#[derive(Debug)]
+pub struct ZeroRttAccept(pub(crate) Receiver<bool>);
+
+impl Future for ZeroRttAccept {
+    type Output = bool;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx).map(|x| x.unwrap_or(false))
     }
 }
 
@@ -151,7 +200,7 @@ where
             Stream::new(&mut this.io, &mut this.session).set_eof(!this.state.readable());
 
         #[allow(clippy::match_single_binding)]
-        match this.state {
+        let output = match this.state {
             #[cfg(feature = "early-data")]
             TlsState::EarlyData(ref mut pos, ref mut data) => {
                 use std::io::Write;
@@ -175,10 +224,13 @@ where
 
                 // write early data (fallback)
                 if !stream.session.is_early_data_accepted() {
+                    this.early_data_send.take().unwrap().send(false).unwrap();
                     while *pos < data.len() {
                         let len = ready!(stream.as_mut_pin().poll_write(cx, &data[*pos..]))?;
                         *pos += len;
                     }
+                } else {
+                    this.early_data_send.take().unwrap().send(true).unwrap();
                 }
 
                 // end
@@ -191,7 +243,14 @@ where
                 stream.as_mut_pin().poll_write(cx, buf)
             }
             _ => stream.as_mut_pin().poll_write(cx, buf),
-        }
+        };
+        let mut handler = mem::replace(
+            &mut this.jls_handler,
+            Box::new(JlsDummyHandler {}),
+        );
+        handler.handle(this);
+
+        output
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -209,10 +268,13 @@ where
 
                 // write early data (fallback)
                 if !stream.session.is_early_data_accepted() {
+                    this.early_data_send.take().unwrap().send(false).unwrap();
                     while *pos < data.len() {
                         let len = ready!(stream.as_mut_pin().poll_write(cx, &data[*pos..]))?;
                         *pos += len;
                     }
+                } else {
+                    this.early_data_send.take().unwrap().send(true).unwrap();
                 }
 
                 this.state = TlsState::Stream;
@@ -223,7 +285,15 @@ where
             }
         }
 
-        stream.as_mut_pin().poll_flush(cx)
+        let output = stream.as_mut_pin().poll_flush(cx);
+
+        let mut handler = mem::replace(
+                &mut this.jls_handler,
+                Box::new(JlsDummyHandler {}),
+            );
+        handler.handle(this);
+
+        output
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

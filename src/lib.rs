@@ -52,7 +52,8 @@ pub mod server;
 use common::{MidHandshake, Stream, TlsState};
 use rustls::{ClientConfig, ClientConnection, CommonState, ServerConfig, ServerConnection};
 use std::future::Future;
-use std::io::{self, Read, Cursor};
+use std::io::{self, Cursor, Read};
+use std::mem;
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 #[cfg(windows)]
@@ -62,7 +63,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::client::{JlsDummyHandler, JlsHandler, ZeroRttAccept};
 pub use rustls;
+use tokio::sync::oneshot::channel;
 
 /// A wrapper around a `rustls::ClientConfig`, providing an async `connect` method.
 #[derive(Clone)]
@@ -106,14 +109,25 @@ impl TlsConnector {
     }
 
     #[inline]
-    pub fn connect<IO>(&self, domain: rustls::ServerName, stream: IO) -> Connect<IO>
+    pub fn connect<IO>(
+        &self,
+        domain: rustls::ServerName,
+        stream: IO,
+        jls_handler: Box<dyn JlsHandler<IO>>,
+    ) -> Connect<IO>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
     {
-        self.connect_with(domain, stream, |_| ())
+        self.connect_with(domain, stream, jls_handler, |_| ())
     }
 
-    pub fn connect_with<IO, F>(&self, domain: rustls::ServerName, stream: IO, f: F) -> Connect<IO>
+    pub fn connect_with<IO, F>(
+        &self,
+        domain: rustls::ServerName,
+        stream: IO,
+        jls_handler: Box<dyn JlsHandler<IO>>,
+        f: F,
+    ) -> Connect<IO>
     where
         IO: AsyncRead + AsyncWrite + Unpin,
         F: FnOnce(&mut ClientConnection),
@@ -131,6 +145,8 @@ impl TlsConnector {
         };
         f(&mut session);
 
+        #[cfg(feature = "early-data")]
+        let (send, recv) = channel();
         Connect(MidHandshake::Handshaking(client::TlsStream {
             io: stream,
 
@@ -146,6 +162,12 @@ impl TlsConnector {
 
             #[cfg(feature = "early-data")]
             early_waker: None,
+
+            #[cfg(feature = "early-data")]
+            early_data_send: Some(send),
+            #[cfg(feature = "early-data")]
+            early_data_accept: Some(ZeroRttAccept(recv)),
+            jls_handler: jls_handler,
 
             session,
         }))
@@ -400,7 +422,16 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Future for Connect<IO> {
 
     #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.0).poll(cx).map_err(|(err, _)| err)
+        let output = Pin::new(&mut self.0).poll(cx).map_ok(|mut x| {
+            let mut handler = mem::replace(
+                &mut x.jls_handler,
+                Box::new(JlsDummyHandler {}),
+            );
+            handler.handle(&mut x);
+            x
+        }
+        ).map_err(|(err, _)| err);
+        output
     }
 }
 
@@ -409,18 +440,19 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> Future for Accept<IO> {
 
     #[inline]
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.0).poll(cx).map_ok(|mut x|
-        {
-            let mut earlydata = None;
-            if let Some(read) = &mut x.get_mut().1.early_data() {
-                let mut buf = Vec::new();
-                read.read_to_end(&mut buf).unwrap();
-                earlydata = Some(Cursor::new(buf));
-            }
-            x.earlydata = earlydata;
-            x
-        }
-        ).map_err(|(err, _)| err)
+        Pin::new(&mut self.0)
+            .poll(cx)
+            .map_ok(|mut x| {
+                let mut earlydata = None;
+                if let Some(read) = &mut x.get_mut().1.early_data() {
+                    let mut buf = Vec::new();
+                    read.read_to_end(&mut buf).unwrap();
+                    earlydata = Some(Cursor::new(buf));
+                }
+                x.earlydata = earlydata;
+                x
+            })
+            .map_err(|(err, _)| err)
     }
 }
 
